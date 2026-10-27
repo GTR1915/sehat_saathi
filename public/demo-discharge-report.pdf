@@ -1,0 +1,96 @@
+
+
+DischargeReady
+From a 10-page clinical report to a clear care plan, double-checked by 
+AI agents.
+Naitik Srivastava  |  GL Bajaj Institute  of Technology and Management
+
+The problem: discharge day confusion
+~1 in 5
+Medicare patients  are readmitted 
+within 30 days (US CMS data)
+Dense
+10 pages of clinical shorthand,  ICD codes and abbreviations.
+Complex
+Multiple  drugs, different  times, hold rules and dose limits.
+Easy to miss
+Diet, activity limits and follow-up  dates buried in the text.
+
+How DischargeReady works
+1
+Upload
+Paste text or upload the 
+discharge PDF.
+2
+Understand
+Plain-language  summary in 
+English, Hindi or Hinglish.
+3
+Act
+Daily schedule, roadmap, 
+checklist and calendar 
+reminders.
+
+Multi-agent architecture
+1 · Medical Parser
+Reads the report. Extracts 
+diagnoses, meds, doses, 
+restrictions, follow-ups.
+2 · Care Plan & 
+Timeline
+Builds the daily schedule, 
+roadmap and checklist in 
+plain language.
+3 · Patient Advocate / 
+QA
+Audits for missing, 
+hallucinated or wrong-dose 
+items.
+Safety loop: issues found, plan sent back for a fix
+Every checklist item carries a quote from the source report.
+
+Features
+Plain-language summary
+Why you were admitted and what 
+matters most.
+Daily schedule + roadmap
+Pill times, food rules and follow-ups 
+in order.
+Safety audit tab
+Shows what the QA agent caught 
+and fixed.
+Hindi / Hinglish
+Output in the patient’s own 
+language.
+Ask the report
+Chat grounded only in the 
+discharge text.
+Read aloud + calendar
+Voice playback and .ics reminders.
+
+Why it matters
+Safe by design
+A second agent audits the first. 
+Answers stay grounded in the 
+report, with source quotes.
+Accessible
+Plain language, Hindi and 
+Hinglish,  voice playback. Built for 
+elderly patients  and caregivers.
+Built to scale
+Works on any discharge text. 
+Ready for hospital and health-
+record integration.
+Decision support only. Not a replacement for medical advice.
+
+Roadmap and live demo
+Next steps
+•Drug Safety agent for interaction checks
+•WhatsApp reminders and caregiver sharing
+•More Indian languages
+•Hospital and ABDM health-record integration
+Live demo
+Sample report, Hindi output,  safety audit, Ask 
+the report.
+Fewer misunderstandings. Fewer 
+readmissions.
