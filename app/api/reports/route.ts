@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { extractReportText, ReportTextError } from '@/lib/report-text'
 import type { ReportAnalysis, SafetyFlag } from '@/lib/report-analysis'
+import { isLanguage, languageInstruction, type Language } from '@/lib/language'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -17,7 +18,7 @@ Rules:
 - Make the summary easy to understand (about 3–5 short sentences). Explain what happened, what the patient should do next, and what needs attention.
 - Use tasks only for the small, checkable actions a person can complete today. The interface automatically turns every medication in the medications list into a checkbox, so never duplicate medicines, “take medicines as prescribed,” “resume home medications,” “complete/finish a course,” or other medication-wide reminders in tasks.
 - A task must be a specific non-medication action that can reasonably be marked done today, such as “Follow diabetic diet,” “Check blood pressure,” “Walk for 10 minutes,” “Change wound dressing,” or “Record blood glucose.” Put broad or ongoing instructions such as gradual activity resumption, generic medication resumption, and course-completion reminders in restrictions instead. Put appointments in followUps, not tasks.
-- Create one followUps entry for every clinician visit, test, imaging study, or other scheduled review. Preserve relative timing exactly as written (for example, “Within 7–10 days” or “In 6 weeks”) in the date field. Use empty strings for fields the report does not state—never use placeholders such as “Not specified,” “N/A,” or “Unknown.” For example, “Follow up with Primary Care Physician, Dr. Alice Smith, within 7–10 days. A repeat chest X-ray has been scheduled in 6 weeks.” becomes two entries: a primary-care follow-up with date “Within 7–10 days,” and a repeat chest X-ray with date “In 6 weeks.”
+- Create one followUps entry for every clinician visit, test, imaging study, or other scheduled review. Preserve relative timing exactly as written (for example, “Within 7–10 days” or “In 6 weeks”) in the date field. In reason, write the short patient-facing instruction from the report, including the provider or test when stated. Use empty strings for fields the report does not state—never use placeholders such as “Not specified,” “N/A,” or “Unknown.” Order followUps from soonest to latest. For example, “Follow up with Primary Care Physician, Dr. Alice Smith, within 7–10 days. A repeat chest X-ray has been scheduled in 6 weeks.” becomes two entries: first, the instruction “Follow up with Primary Care Physician, Dr. Alice Smith” with date “Within 7–10 days”; second, the instruction “Repeat chest X-ray” with date “In 6 weeks.”
 - Include a source reference for every extracted item. Prefer a short quote and page number when the document supplies one; otherwise say “Discharge report”.
 - Safety flags must surface urgent return precautions, conflicts, missing medication parameters, or instructions that need clinician confirmation. Use “urgent” only when the report itself gives an urgent warning.
 - Do not include information that is not in the report. This output supports care coordination and does not replace a healthcare professional.`
@@ -65,7 +66,7 @@ const CARE_PLAN_SCHEMA = {
         type: 'object', additionalProperties: false,
         required: ['clinician', 'specialty', 'date', 'time', 'location', 'reason', 'source'],
         properties: {
-          clinician: { type: 'string' }, specialty: { type: 'string' }, date: { type: 'string' }, time: { type: 'string' }, location: { type: 'string' }, reason: { type: 'string' }, source: { type: 'string' },
+          clinician: { type: 'string' }, specialty: { type: 'string' }, date: { type: 'string', description: 'Exact document date or relative timing.' }, time: { type: 'string' }, location: { type: 'string' }, reason: { type: 'string', description: 'Short patient-facing instruction from the report, including the provider or test when stated.' }, source: { type: 'string' },
         },
       },
     },
@@ -150,8 +151,8 @@ function parseJson(text: string): unknown {
   return JSON.parse(cleaned)
 }
 
-function userMessage(text: string) {
-  return `Extract the patient-facing discharge care plan from the report text below. Return only the requested JSON object. If a section has no report-grounded items, use an empty list.\n\nReport text:\n\n${text}`
+function userMessage(text: string, language: Language) {
+  return `Extract the patient-facing discharge care plan from the report text below. ${languageInstruction(language)} Return only the requested JSON object. If a section has no report-grounded items, use an empty list.\n\nReport text:\n\n${text}`
 }
 
 export async function POST(request: Request) {
@@ -163,6 +164,8 @@ export async function POST(request: Request) {
 
     const formData = await request.formData()
     const file = formData.get('report')
+    const requestedLanguage = formData.get('language')
+    const language = isLanguage(requestedLanguage) ? requestedLanguage : 'English'
     if (!file || typeof file === 'string') {
       return NextResponse.json({ error: 'Choose a PDF or text discharge report first.' }, { status: 400 })
     }
@@ -196,7 +199,7 @@ export async function POST(request: Request) {
         },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userMessage(text) },
+          { role: 'user', content: userMessage(text, language) },
         ],
       }),
     })
@@ -215,7 +218,7 @@ export async function POST(request: Request) {
     }
 
     const analysis = normalizeAnalysis(parseJson(responseText(payload)))
-    return NextResponse.json({ analysis, model: MODEL })
+    return NextResponse.json({ analysis, model: MODEL, language })
   } catch (error) {
     console.error('[reports] Generation failed:', error)
     const message = error instanceof SyntaxError || error instanceof Error && error.message.includes('usable summary')

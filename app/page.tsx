@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { ReportChat } from '@/components/report-chat'
 import type { FollowUp, ReportAnalysis } from '@/lib/report-analysis'
+import { getUiCopy, languageGroups, type Language } from '@/lib/language'
 import {
   Activity,
   AlertTriangle,
@@ -15,6 +16,7 @@ import {
   ChevronRight,
   ClipboardCheck,
   FileText,
+  FileDown,
   HeartPulse,
   Languages,
   LayoutDashboard,
@@ -64,11 +66,11 @@ Walk gently for 10–15 minutes and stop if dizzy or short of breath. Follow a l
 Follow up with Dr. Mehta in Cardiology at City Hospital on 20 June 2024 at 10:30 AM.
 Clarify which medicine to hold for low blood pressure and the relevant blood-pressure threshold.`
 
-const navItems: { id: Tab; label: string; icon: LucideIcon }[] = [
-  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
-  { id: 'care-plan', label: 'My care plan', icon: ClipboardCheck },
-  { id: 'safety', label: 'Safety audit', icon: ShieldCheck },
-  { id: 'ask-report', label: 'Ask your report', icon: MessageCircle },
+const navItems: { id: Tab; labelKey: 'overview' | 'carePlan' | 'safety' | 'ask'; icon: LucideIcon }[] = [
+  { id: 'overview', labelKey: 'overview', icon: LayoutDashboard },
+  { id: 'care-plan', labelKey: 'carePlan', icon: ClipboardCheck },
+  { id: 'safety', labelKey: 'safety', icon: ShieldCheck },
+  { id: 'ask-report', labelKey: 'ask', icon: MessageCircle },
 ]
 
 function SourceTag({ children = 'From your report' }: { children?: string }) {
@@ -86,6 +88,29 @@ function followUpTitle(followUp: FollowUp) {
 
 function followUpTiming(followUp: FollowUp) {
   return [followUp.date, followUp.time, followUp.location].filter(Boolean).join(' · ')
+}
+
+function followUpSortValue(followUp: FollowUp) {
+  const timing = followUp.date.toLowerCase()
+  if (/\btoday\b/.test(timing)) return 0
+  if (/\btomorrow\b/.test(timing)) return 1
+
+  const relative = timing.match(/(?:within|in|after)\s+(\d+(?:\.\d+)?)(?:\s*[-–]\s*\d+(?:\.\d+)?)?\s*(day|week|month|year)s?\b/)
+  if (relative) {
+    const amount = Number(relative[1])
+    const unit = relative[2]
+    return amount * (unit === 'day' ? 1 : unit === 'week' ? 7 : unit === 'month' ? 30 : 365)
+  }
+
+  const calendarDate = Date.parse(followUp.date)
+  return Number.isNaN(calendarDate) ? Number.POSITIVE_INFINITY : Math.max(0, Math.ceil((calendarDate - Date.now()) / 86_400_000))
+}
+
+function nextFollowUp(followUps: FollowUp[]) {
+  return followUps.reduce<FollowUp | undefined>((next, followUp) => {
+    if (!next || followUpSortValue(followUp) < followUpSortValue(next)) return followUp
+    return next
+  }, undefined)
 }
 
 function isChecklistTask(title: string, detail: string) {
@@ -130,11 +155,101 @@ function taskList(analysis: ReportAnalysis): Task[] {
   }))
 }
 
+function localDateStamp(date = new Date()) {
+  return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`
+}
+
+function downloadBlob(contents: BlobPart, filename: string, type: string) {
+  const url = URL.createObjectURL(new Blob([contents], { type }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+function escapeIcs(value: string) {
+  return value.replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n')
+}
+
+function localDateTimeStamp(date: Date) {
+  return `${localDateStamp(date)}T${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}${String(date.getSeconds()).padStart(2, '0')}`
+}
+
+function utcDateTimeStamp(date = new Date()) {
+  return date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')
+}
+
+function calendarTiming(schedule: string) {
+  const match = schedule.match(/\b(\d{1,2}):(\d{2})\s*(AM|PM)?\b/i)
+  if (!match) {
+    const start = new Date()
+    const end = new Date(start)
+    end.setDate(end.getDate() + 1)
+    return { allDay: true, start: localDateStamp(start), end: localDateStamp(end) }
+  }
+
+  let hour = Number(match[1])
+  const meridiem = match[3]?.toUpperCase()
+  if (meridiem === 'PM' && hour < 12) hour += 12
+  if (meridiem === 'AM' && hour === 12) hour = 0
+  const start = new Date()
+  start.setHours(hour, Number(match[2]), 0, 0)
+  const end = new Date(start.getTime() + 15 * 60_000)
+  return { allDay: false, start: localDateTimeStamp(start), end: localDateTimeStamp(end) }
+}
+
+function medicationRecurrence(schedule: string, instructions: string) {
+  const courseLength = `${schedule} ${instructions}`.match(/\bfor\s+(\d+)\s+(?:more\s+)?days?\b/i)
+  return courseLength ? `RRULE:FREQ=DAILY;COUNT=${courseLength[1]}` : 'RRULE:FREQ=DAILY'
+}
+
+function csvCell(value: string) {
+  const safeValue = /^[=+\-@]/.test(value) ? `'${value}` : value
+  return `"${safeValue.replace(/"/g, '""')}"`
+}
+
+function pdfText(value: string) {
+  return value.normalize('NFKD').replace(/[^\x20-\x7E]/g, '?').replace(/([\\()])/g, '\\$1')
+}
+
+function medicationHistoryPdf(rows: string[]) {
+  const pageRows: string[][] = []
+  for (let index = 0; index < rows.length; index += 38) pageRows.push(rows.slice(index, index + 38))
+  const pageCount = Math.max(pageRows.length, 1)
+  const fontId = 3 + pageCount * 2
+  const objects = new Map<number, string>()
+  const pageIds = Array.from({ length: pageCount }, (_, index) => 3 + index * 2)
+  objects.set(1, '<< /Type /Catalog /Pages 2 0 R >>')
+  objects.set(2, `<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(' ')}] /Count ${pageCount} >>`)
+
+  for (let index = 0; index < pageCount; index += 1) {
+    const pageId = pageIds[index]
+    const contentId = pageId + 1
+    const lines = pageRows[index] ?? []
+    const content = ['BT', '/F1 16 Tf', '50 750 Td', `(${pdfText(index === 0 ? 'DischargeReady medication history' : 'DischargeReady medication history (continued)')}) Tj`, '/F1 9 Tf', ...lines.map((line) => `0 -16 Td\n(${pdfText(line.slice(0, 105))}) Tj`), 'ET'].join('\n')
+    objects.set(pageId, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 ${fontId} 0 R >> >> /Contents ${contentId} 0 R >>`)
+    objects.set(contentId, `<< /Length ${content.length} >>\nstream\n${content}\nendstream`)
+  }
+  objects.set(fontId, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+  for (let id = 1; id <= fontId; id += 1) {
+    offsets[id] = pdf.length
+    pdf += `${id} 0 obj\n${objects.get(id)}\nendobj\n`
+  }
+  const xrefOffset = pdf.length
+  pdf += `xref\n0 ${fontId + 1}\n0000000000 65535 f \n`
+  for (let id = 1; id <= fontId; id += 1) pdf += `${String(offsets[id]).padStart(10, '0')} 00000 n \n`
+  return `${pdf}trailer\n<< /Size ${fontId + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`
+}
+
 export default function Page() {
   const [activeTab, setActiveTab] = useState<Tab>('overview')
   const [analysis, setAnalysis] = useState<ReportAnalysis | null>(null)
   const [tasks, setTasks] = useState<Task[]>([])
-  const [language, setLanguage] = useState('English')
+  const [language, setLanguage] = useState<Language>('English')
   const [menuOpen, setMenuOpen] = useState(false)
   const [reportName, setReportName] = useState('')
   const [reportStatus, setReportStatus] = useState('No report submitted')
@@ -146,7 +261,8 @@ export default function Page() {
   const completed = tasks.filter((task) => task.done).length
   const progress = tasks.length ? Math.round((completed / tasks.length) * 100) : 0
   const greeting = useMemo(() => language === 'Hindi' ? 'नमस्ते' : language === 'Hinglish' ? 'Namaste' : 'Good morning', [language])
-  const followUp = analysis?.followUps[0]
+  const copy = getUiCopy(language)
+  const followUp = analysis ? nextFollowUp(analysis.followUps) : undefined
   const safetyFlag = analysis?.safetyFlags[0]
 
   function applyAnalysis(nextAnalysis: ReportAnalysis, name: string, status: string, file: File) {
@@ -161,7 +277,51 @@ export default function Page() {
     setTasks((current) => current.map((task) => task.id === id ? { ...task, done: !task.done } : task))
   }
 
-  async function processReport(file: File) {
+  function downloadMedicationChecklist() {
+    if (!analysis || !analysis.medications.length) return
+    const date = localDateStamp()
+    const timestamp = utcDateTimeStamp()
+    const entries = analysis.medications.map((medication, index) => {
+      const hasClockTime = /\b\d{1,2}:\d{2}\s*(AM|PM)?\b/i.test(medication.schedule)
+      const summary = `Take ${medication.name}${medication.dose ? ` ${medication.dose}` : ''}${!hasClockTime && medication.schedule ? ` (${medication.schedule})` : ''}`
+      const timing = calendarTiming(medication.schedule)
+      const description = [medication.schedule, medication.instructions, timing.allDay ? 'No exact clock time was stated in the report. Set a reminder time in Outlook if needed.' : '', medication.source].filter(Boolean).join(' | ')
+      const alarm = timing.allDay ? [] : ['BEGIN:VALARM', 'TRIGGER:-PT0M', 'ACTION:DISPLAY', `DESCRIPTION:${escapeIcs(`Reminder: ${summary}`)}`, 'END:VALARM']
+      return [
+        'BEGIN:VEVENT',
+        `UID:dischargeready-medication-${index}-${date}@local`,
+        `DTSTAMP:${timestamp}`,
+        'STATUS:CONFIRMED',
+        timing.allDay ? `DTSTART;VALUE=DATE:${timing.start}` : `DTSTART:${timing.start}`,
+        timing.allDay ? `DTEND;VALUE=DATE:${timing.end}` : `DTEND:${timing.end}`,
+        medicationRecurrence(medication.schedule, medication.instructions),
+        `SUMMARY:${escapeIcs(summary)}`,
+        `DESCRIPTION:${escapeIcs(description)}`,
+        ...alarm,
+        'END:VEVENT',
+      ].join('\r\n')
+    })
+    const calendar = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//DischargeReady//Medication Schedule//EN', 'CALSCALE:GREGORIAN', 'METHOD:PUBLISH', ...entries, 'END:VCALENDAR'].join('\r\n')
+    downloadBlob(calendar, `medication-checklist-${date}.ics`, 'text/calendar;charset=utf-8')
+  }
+
+  function downloadMedicationHistory() {
+    if (!analysis || !analysis.medications.length) return
+    const date = localDateStamp()
+    const history = analysis.medications.map((medication) => {
+      const task = tasks.find((item) => item.title.toLowerCase().includes(medication.name.toLowerCase()))
+      return { medication, status: task?.done ? 'Taken' : 'Not marked taken' }
+    })
+    const headers = ['Date', 'Medication', 'Dose', 'Schedule', 'Instructions', 'Status', 'Source']
+    const csv = [headers, ...history.map(({ medication, status }) => [date, medication.name, medication.dose, medication.schedule, medication.instructions, status, medication.source])]
+      .map((row) => row.map((value) => csvCell(value)).join(','))
+      .join('\r\n')
+    const pdfRows = [`Exported: ${new Date().toLocaleString()}`, '', ...history.map(({ medication, status }) => `${status} | ${medication.name}${medication.dose ? ` ${medication.dose}` : ''} | ${medication.schedule || 'As directed'} | ${medication.instructions || 'See report'}`)]
+    downloadBlob(csv, `medication-history-${date}.csv`, 'text/csv;charset=utf-8')
+    downloadBlob(medicationHistoryPdf(pdfRows), `medication-history-${date}.pdf`, 'application/pdf')
+  }
+
+  async function processReport(file: File, selectedLanguage = language) {
     setIsProcessing(true)
     setAnalysis(null)
     setTasks([])
@@ -171,6 +331,7 @@ export default function Page() {
     try {
       const formData = new FormData()
       formData.append('report', file)
+      formData.append('language', selectedLanguage)
       const response = await fetch('/api/reports', { method: 'POST', body: formData })
       const result = await response.json()
       if (!response.ok) throw new Error(result.error || 'Could not process report')
@@ -189,32 +350,38 @@ export default function Page() {
     setActiveTab('care-plan')
   }
 
+  function changeLanguage(nextLanguage: Language) {
+    if (nextLanguage === language) return
+    setLanguage(nextLanguage)
+    if (reportFile && analysis) void processReport(reportFile, nextLanguage)
+  }
+
   return <div className="app-shell">
     <aside className={`sidebar ${menuOpen ? 'sidebar-open' : ''}`}>
       <div className="brand"><div className="brand-mark"><HeartPulse size={21} /></div><div><strong>Discharge<span>Ready</span></strong><small>care, made clearer</small></div></div>
       <div className="patient-card">{hasReport ? <><div className="avatar">PS</div><div><strong>Patient report</strong><span>Care plan active</span></div><CheckCircle2 size={17} className="patient-check" /></> : <><div className="avatar"><FileText size={15} /></div><div><strong>No patient report</strong><span>Upload a report to begin</span></div></>}</div>
-      <nav className="nav-list" aria-label="Main navigation"><p className="nav-label">YOUR CARE</p>{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={`nav-item ${activeTab === id ? 'active' : ''}`} onClick={() => { setActiveTab(id); setMenuOpen(false) }}><Icon size={18} /><span>{label}</span>{id === 'safety' && analysis?.safetyFlags.length ? <span className="nav-badge">{analysis.safetyFlags.length}</span> : null}</button>)}<p className="nav-label nav-label-space">TOOLS</p><button className="nav-item"><CalendarDays size={18} /><span>Calendar reminders</span></button></nav>
+      <nav className="nav-list" aria-label="Main navigation"><p className="nav-label">{copy.care}</p>{navItems.map(({ id, labelKey, icon: Icon }) => <button key={id} className={`nav-item ${activeTab === id ? 'active' : ''}`} onClick={() => { setActiveTab(id); setMenuOpen(false) }}><Icon size={18} /><span>{copy[labelKey]}</span>{id === 'safety' && analysis?.safetyFlags.length ? <span className="nav-badge">{analysis.safetyFlags.length}</span> : null}</button>)}<p className="nav-label nav-label-space">{copy.tools}</p><button className="nav-item"><CalendarDays size={18} /><span>{copy.calendar}</span></button><p className="nav-label nav-label-space">{copy.export}</p><button className="nav-item export-item" disabled={!analysis?.medications.length} onClick={downloadMedicationChecklist}><FileDown size={18} /><span>{copy.checklist} <small>.ics file</small></span></button><button className="nav-item export-item" disabled={!analysis?.medications.length} onClick={downloadMedicationHistory}><FileDown size={18} /><span>{copy.history} <small>CSV / PDF</small></span></button></nav>
       <div className="sidebar-bottom"><div className="support-card"><div className="support-icon"><ShieldCheck size={18} /></div><div><strong>Report-grounded</strong><span>Items cite their source</span></div></div><div className="sidebar-footer"><ShieldCheck size={14} /> Your data stays private</div></div>
     </aside>
 
     <main className="main-content">
-      <header className="topbar"><button className="mobile-menu" aria-label="Open menu" onClick={() => setMenuOpen(!menuOpen)}><Menu size={21} /></button><div className="breadcrumbs"><span>My care</span><ChevronRight size={14} /><strong>{navItems.find((item) => item.id === activeTab)?.label}</strong></div><div className="top-actions"><div className="language-select"><Languages size={16} /><select value={language} onChange={(event) => setLanguage(event.target.value)} aria-label="Language"><option>English</option><option>Hindi</option><option>Hinglish</option></select></div><button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}><Settings size={18} /></button><button className="icon-button" aria-label="Notifications"><Bell size={18} /></button><div className="top-avatar">PS</div></div></header>
+      <header className="topbar"><button className="mobile-menu" aria-label="Open menu" onClick={() => setMenuOpen(!menuOpen)}><Menu size={21} /></button><div className="breadcrumbs"><span>{copy.carePlan}</span><ChevronRight size={14} /><strong>{copy[navItems.find((item) => item.id === activeTab)?.labelKey ?? 'overview']}</strong></div><div className="top-actions"><div className="language-select"><Languages size={16} /><select value={language} onChange={(event) => changeLanguage(event.target.value as Language)} aria-label="Language">{languageGroups.map((group) => <optgroup key={group.label} label={group.label}>{group.languages.map((item) => <option key={item} value={item}>{item}</option>)}</optgroup>)}</select></div><button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}><Settings size={18} /></button><button className="icon-button" aria-label="Notifications"><Bell size={18} /></button><div className="top-avatar">PS</div></div></header>
 
       {settingsOpen && <div className="settings-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="settings-panel"><div className="settings-header"><div><span className="eyebrow">AI CONNECTION</span><h2 id="settings-title">OpenRouter settings</h2></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div><p className="settings-description">The API key is read from <code>OPENROUTER_API_KEY</code> on the server. It is never sent from this browser.</p><div className="model-note"><Sparkles size={15} /><span>Model: <strong>Gemini 3.1 Flash Lite</strong><small>google/gemini-3.1-flash-lite</small></span></div><Button onClick={() => setSettingsOpen(false)}>Close</Button></div></div>}
 
       <div className="page-wrap">
-        {activeTab === 'overview' && <Overview greeting={greeting} analysis={analysis} tasks={tasks} completed={completed} progress={progress} reportName={reportName} reportStatus={reportStatus} isProcessing={isProcessing} onUpload={processReport} onDemo={loadDemoReport} onOpenPlan={() => setActiveTab('care-plan')} onOpenSafety={() => setActiveTab('safety')} onToggleTask={toggleTask} />}
+        {activeTab === 'overview' && <Overview greeting={greeting} copy={copy} analysis={analysis} tasks={tasks} completed={completed} progress={progress} reportName={reportName} reportStatus={reportStatus} isProcessing={isProcessing} onUpload={processReport} onDemo={loadDemoReport} onOpenPlan={() => setActiveTab('care-plan')} onOpenSafety={() => setActiveTab('safety')} onToggleTask={toggleTask} />}
         {activeTab !== 'overview' && !analysis && <EmptyState onDemo={loadDemoReport} />}
-        {activeTab === 'care-plan' && analysis && <CarePlan analysis={analysis} tasks={tasks} language={language} onToggleTask={toggleTask} />}
+        {activeTab === 'care-plan' && analysis && <CarePlan analysis={analysis} tasks={tasks} language={language} copy={copy} onToggleTask={toggleTask} />}
         {activeTab === 'safety' && analysis && <SafetyAudit analysis={analysis} />}
-        {activeTab === 'ask-report' && analysis && <ReportChat reportFile={reportFile} />}
+        {activeTab === 'ask-report' && analysis && <ReportChat reportFile={reportFile} language={language} />}
       </div>
     </main>
   </div>
 }
 
-function Overview({ greeting, analysis, tasks, completed, progress, reportName, reportStatus, isProcessing, onUpload, onDemo, onOpenPlan, onOpenSafety, onToggleTask }: { greeting: string; analysis: ReportAnalysis | null; tasks: Task[]; completed: number; progress: number; reportName: string; reportStatus: string; isProcessing: boolean; onUpload: (file: File) => void; onDemo: () => void; onOpenPlan: () => void; onOpenSafety: () => void; onToggleTask: (id: number) => void }) {
-  const followUp = analysis?.followUps[0]
+function Overview({ greeting, copy, analysis, tasks, completed, progress, reportName, reportStatus, isProcessing, onUpload, onDemo, onOpenPlan, onOpenSafety, onToggleTask }: { greeting: string; copy: Record<string, string>; analysis: ReportAnalysis | null; tasks: Task[]; completed: number; progress: number; reportName: string; reportStatus: string; isProcessing: boolean; onUpload: (file: File) => void; onDemo: () => void; onOpenPlan: () => void; onOpenSafety: () => void; onToggleTask: (id: number) => void }) {
+  const followUp = analysis ? nextFollowUp(analysis.followUps) : undefined
   const safetyFlag = analysis?.safetyFlags[0]
   return <>
     <section className="welcome-row"><div><div className="eyebrow"><span className="live-dot" /> CARE PLAN</div><h1>{greeting}</h1><p className="subtitle">Upload a discharge report for a clear, report-grounded recovery plan.</p></div></section>
@@ -231,9 +398,9 @@ function EmptyState({ onDemo }: { onDemo: () => void }) {
   return <section className="empty-report-state"><div className="empty-report-icon"><FileText size={24} /></div><h2>Your care plan will appear here</h2><p>Submit a discharge report to generate patient-specific medicines, tasks, appointments, and safety guidance.</p><button className="demo-button" onClick={onDemo}>Load demo report</button></section>
 }
 
-function CarePlan({ analysis, tasks, language, onToggleTask }: { analysis: ReportAnalysis; tasks: Task[]; language: string; onToggleTask: (id: number) => void }) {
-  const followUp = analysis.followUps[0]
-  return <><section className="welcome-row"><div><div className="eyebrow"><span className="live-dot" /> AI-GENERATED CARE PLAN</div><h1>Your care plan</h1><p className="subtitle">A clear, source-grounded guide for recovery after discharge.</p></div></section><div className="plan-layout"><div className="plan-main"><div className="plan-card"><div className="plan-card-header"><div><span className="mini-label teal-label"><Sparkles size={14} /> SIMPLIFIED SUMMARY · {language.toUpperCase()}</span><h2>What happened &amp; what matters now</h2></div></div><p>{analysis.summary}</p>{analysis.diagnoses.length > 0 && <p><strong>Reported diagnoses:</strong> {analysis.diagnoses.join(', ')}</p>}<SourceTag>Generated only from your uploaded report</SourceTag></div><div className="section-heading inner-heading"><div><h2>Medication schedule</h2><p>Never change a dose without asking your healthcare professional.</p></div></div><div className="schedule-card">{analysis.medications.length ? analysis.medications.map((medication, index) => <div className="schedule-row" key={`${medication.name}-${index}`}><div className="time-column"><strong>{medication.schedule || 'As directed'}</strong><span>Report instruction</span></div><div className={`med-icon ${['teal', 'blue', 'purple'][index % 3]}`}><Pill size={18} /></div><div className="schedule-info"><strong>{medication.name} <span>{medication.dose}</span></strong><small>{medication.instructions || 'See discharge instructions'}</small><SourceTag>{medication.source}</SourceTag></div></div>) : <div className="schedule-row"><div className="schedule-info"><strong>No discharge medicines found</strong><small>Confirm the medication plan directly with your care team.</small></div></div>}</div><div className="two-cards">{analysis.restrictions.length ? analysis.restrictions.map((restriction, index) => <div className="small-plan-card" key={`${restriction.title}-${index}`}><div className={`small-card-icon ${index % 2 ? 'orange' : 'green'}`}><Activity size={18} /></div><h3>{restriction.title}</h3><p>{restriction.details}</p><SourceTag>{restriction.source}</SourceTag></div>) : <div className="small-plan-card"><div className="small-card-icon green"><Activity size={18} /></div><h3>No restrictions extracted</h3><p>The report did not state activity or diet restrictions.</p></div>}</div></div><aside className="plan-side"><div className="side-card"><div className="side-card-title"><ClipboardCheck size={18} /><strong>Today&apos;s progress</strong></div>{tasks.length ? tasks.map((task) => <button className="mini-task" key={task.id} onClick={() => onToggleTask(task.id)}><span className={`task-check ${task.done ? 'checked' : ''}`}>{task.done && <Check size={12} />}</span><span>{task.title}</span></button>) : <p>No tasks extracted from this report.</p>}</div><div className="side-card followup-card"><div className="side-card-title"><CalendarDays size={18} /><strong>Next follow-up</strong></div>{followUp ? <><strong className="followup-name">{followUpTitle(followUp)}</strong><span>{followUpTiming(followUp) || followUp.reason}</span><SourceTag>{followUp.source}</SourceTag></> : <span>No follow-up appointment was found in the report.</span>}</div></aside></div><div className="disclaimer"><AlertTriangle size={15} /><span>{analysis.disclaimer}</span></div></>
+function CarePlan({ analysis, tasks, language, copy, onToggleTask }: { analysis: ReportAnalysis; tasks: Task[]; language: Language; copy: Record<string, string>; onToggleTask: (id: number) => void }) {
+  const followUp = nextFollowUp(analysis.followUps)
+  return <><section className="welcome-row"><div><div className="eyebrow"><span className="live-dot" /> AI-GENERATED CARE PLAN</div><h1>Your care plan</h1><p className="subtitle">A clear, source-grounded guide for recovery after discharge.</p></div></section><div className="plan-layout"><div className="plan-main"><div className="plan-card"><div className="plan-card-header"><div><span className="mini-label teal-label"><Sparkles size={14} /> SIMPLIFIED SUMMARY · {language.toUpperCase()}</span><h2>What happened &amp; what matters now</h2></div></div><p>{analysis.summary}</p>{analysis.diagnoses.length > 0 && <p><strong>Reported diagnoses:</strong> {analysis.diagnoses.join(', ')}</p>}<SourceTag>Generated only from your uploaded report</SourceTag></div><div className="section-heading inner-heading"><div><h2>Medication schedule</h2><p>Never change a dose without asking your healthcare professional.</p></div></div><div className="schedule-card">{analysis.medications.length ? analysis.medications.map((medication, index) => <div className="schedule-row" key={`${medication.name}-${index}`}><div className="time-column"><strong>{medication.schedule || 'As directed'}</strong><span>Report instruction</span></div><div className={`med-icon ${['teal', 'blue', 'purple'][index % 3]}`}><Pill size={18} /></div><div className="schedule-info"><strong>{medication.name} <span>{medication.dose}</span></strong><small>{medication.instructions || 'See discharge instructions'}</small><SourceTag>{medication.source}</SourceTag></div></div>) : <div className="schedule-row"><div className="schedule-info"><strong>No discharge medicines found</strong><small>Confirm the medication plan directly with your care team.</small></div></div>}</div><div className="two-cards">{analysis.restrictions.length ? analysis.restrictions.map((restriction, index) => <div className="small-plan-card" key={`${restriction.title}-${index}`}><div className={`small-card-icon ${index % 2 ? 'orange' : 'green'}`}><Activity size={18} /></div><h3>{restriction.title}</h3><p>{restriction.details}</p><SourceTag>{restriction.source}</SourceTag></div>) : <div className="small-plan-card"><div className="small-card-icon green"><Activity size={18} /></div><h3>No restrictions extracted</h3><p>The report did not state activity or diet restrictions.</p></div>}</div></div><aside className="plan-side"><div className="side-card"><div className="side-card-title"><ClipboardCheck size={18} /><strong>Today&apos;s progress</strong></div>{tasks.length ? tasks.map((task) => <button className="mini-task" key={task.id} onClick={() => onToggleTask(task.id)}><span className={`task-check ${task.done ? 'checked' : ''}`}>{task.done && <Check size={12} />}</span><span>{task.title}</span></button>) : <p>No tasks extracted from this report.</p>}</div><div className="side-card followup-card"><div className="side-card-title"><CalendarDays size={18} /><strong>Next follow-up</strong></div>{followUp ? <><strong className="followup-name">{followUpTitle(followUp)}</strong><span>{[followUpTiming(followUp), followUp.reason].filter(Boolean).join(' · ')}</span><SourceTag>{followUp.source}</SourceTag></> : <span>No follow-up appointment was found in the report.</span>}</div></aside></div><div className="disclaimer"><AlertTriangle size={15} /><span>{analysis.disclaimer}</span></div></>
 }
 
 function SafetyAudit({ analysis }: { analysis: ReportAnalysis }) {
